@@ -65,6 +65,12 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 	if err := waitSendEnabled(c, 5*time.Second); err != nil {
 		return nil, err
 	}
+	// Snapshot any images already in /images/ (the gallery shows recent
+	// generations as thumbnails) so we can tell our new one apart from them.
+	baseline, err := captureBaselineImages(c)
+	if err != nil {
+		return nil, err
+	}
 	if err := c.Click("#composer-submit-button"); err != nil {
 		return nil, fmt.Errorf("click send: %w", err)
 	}
@@ -73,11 +79,11 @@ func Gen(c *browser.Client, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	imgInfo, err := waitForGeneratedImage(c, opts.Timeout)
+	imgInfo, err := waitForGeneratedImage(c, baseline, opts.Timeout)
 	if err != nil {
 		return nil, err
 	}
-	pngBytes, err := downloadImage(c, imgInfo.Src)
+	pngBytes, err := downloadImage(c, imgInfo.FileID, imgInfo.Src)
 	if err != nil {
 		return nil, err
 	}
@@ -186,29 +192,77 @@ func waitConversationURL(c *browser.Client, timeout time.Duration) (string, erro
 }
 
 type imgInfo struct {
-	Src string `json:"src"`
-	Alt string `json:"alt"`
+	Src    string `json:"src"`
+	Alt    string `json:"alt"`
+	FileID string `json:"fileId"`
+	Width  int    `json:"w"`
+	Height int    `json:"h"`
 }
 
-func waitForGeneratedImage(c *browser.Client, timeout time.Duration) (*imgInfo, error) {
+// captureBaselineImages records the file_id of every estuary image currently
+// in <main>. We use this set as a "don't match these" filter when polling for
+// the newly-generated image, because /images/ pre-renders recent generations
+// as gallery thumbnails and those would otherwise race the real one.
+func captureBaselineImages(c *browser.Client) (map[string]bool, error) {
 	const code = `(function(){
-		const imgs = document.querySelectorAll('main img');
-		for (const img of imgs) {
+		const out = [];
+		for (const img of document.querySelectorAll('main img')) {
 			const s = img.src || '';
-			if (s.includes('/backend-api/estuary/content') && img.complete && img.naturalWidth > 0) {
-				return { src: s, alt: img.alt || '' };
-			}
+			const m = s.match(/[?&]id=(file_[A-Za-z0-9]+)/);
+			if (m) out.push(m[1]);
 		}
-		return { src: '', alt: '' };
+		return out;
+	})()`
+	var ids []string
+	if err := c.EvaluateValue(code, &ids); err != nil {
+		return nil, fmt.Errorf("capture baseline: %w", err)
+	}
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set, nil
+}
+
+func waitForGeneratedImage(c *browser.Client, baseline map[string]bool, timeout time.Duration) (*imgInfo, error) {
+	const code = `(function(){
+		const out = [];
+		for (const img of document.querySelectorAll('main img')) {
+			const s = img.src || '';
+			if (!s.includes('/backend-api/estuary/content')) continue;
+			if (!img.complete || img.naturalWidth === 0) continue;
+			const m = s.match(/[?&]id=(file_[A-Za-z0-9]+)/);
+			out.push({ src: s, alt: img.alt || '', fileId: m ? m[1] : '', w: img.naturalWidth, h: img.naturalHeight });
+		}
+		return out;
 	})()`
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		var out imgInfo
-		if err := c.EvaluateValue(code, &out); err != nil {
+		var candidates []imgInfo
+		if err := c.EvaluateValue(code, &candidates); err != nil {
 			return nil, fmt.Errorf("poll image: %w", err)
 		}
-		if out.Src != "" {
-			return &out, nil
+		// Prefer the "main" generated image: large + conversation-style alt
+		// prefix. If no candidate matches that shape, fall back to any new
+		// image (covers English UI / future alt changes).
+		var fallback *imgInfo
+		for i := range candidates {
+			img := candidates[i]
+			if img.FileID == "" || baseline[img.FileID] {
+				continue
+			}
+			if img.Width < 400 || img.Height < 400 {
+				continue // small inline thumbnails in the sidebar / history strip
+			}
+			if isGeneratedAlt(img.Alt) {
+				return &img, nil
+			}
+			if fallback == nil {
+				fallback = &img
+			}
+		}
+		if fallback != nil {
+			return fallback, nil
 		}
 		if err := checkForError(c); err != nil {
 			return nil, err
@@ -216,6 +270,12 @@ func waitForGeneratedImage(c *browser.Client, timeout time.Duration) (*imgInfo, 
 		time.Sleep(1 * time.Second)
 	}
 	return nil, fmt.Errorf("timeout waiting for generated image (may have been blocked by content policy or quota)")
+}
+
+func isGeneratedAlt(alt string) bool {
+	return strings.HasPrefix(alt, "已生成图片") ||
+		strings.HasPrefix(alt, "Generated image") ||
+		strings.Contains(alt, "generated image")
 }
 
 // checkForError looks for common error banners that ChatGPT surfaces when a
@@ -248,15 +308,21 @@ func checkForError(c *browser.Client) error {
 	return nil
 }
 
-func downloadImage(c *browser.Client, src string) ([]byte, error) {
-	encoded, _ := json.Marshal(src)
+func downloadImage(c *browser.Client, fileID, src string) ([]byte, error) {
+	encodedSrc, _ := json.Marshal(src)
+	encodedFileID, _ := json.Marshal(fileID)
 	// Re-read the live img.src each call — the signed URL is time-sensitive
 	// and the version in the DOM stays fresh while the signature rotates.
+	// Scope the re-read by file_id so we don't accidentally grab a sibling
+	// thumbnail that happens to sit in the same <main>.
 	code := fmt.Sprintf(`(async function(){
 		try {
 			let url = %s;
-			const img = document.querySelector('main img[src*="/backend-api/estuary/content"]');
-			if (img && img.src) url = img.src;
+			const fid = %s;
+			if (fid) {
+				const img = document.querySelector('main img[src*="' + fid + '"]');
+				if (img && img.src) url = img.src;
+			}
 			const r = await fetch(url, { credentials: 'include' });
 			if (!r.ok) return { ok: false, err: 'fetch_failed', status: r.status };
 			const buf = await r.arrayBuffer();
@@ -268,7 +334,7 @@ func downloadImage(c *browser.Client, src string) ([]byte, error) {
 			}
 			return { ok: true, contentType: r.headers.get('content-type') || '', size: u8.length, base64: btoa(s) };
 		} catch (e) { return { ok: false, err: String(e).slice(0, 300) }; }
-	})()`, string(encoded))
+	})()`, string(encodedSrc), string(encodedFileID))
 	var out struct {
 		OK          bool   `json:"ok"`
 		Err         string `json:"err"`
