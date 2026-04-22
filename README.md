@@ -32,6 +32,29 @@ $ chatgpt-image-cli generate "a cute panda riding a bicycle through a bamboo for
 
 ## Install
 
+### Pre-built binary (recommended)
+
+Grab the latest release for your platform from <https://github.com/autoclaw-cc/chatgpt-image-cli/releases/latest>. macOS arm64 example:
+
+```bash
+curl -L -o chatgpt-image-cli \
+  https://github.com/autoclaw-cc/chatgpt-image-cli/releases/latest/download/chatgpt-image-cli-darwin-arm64
+chmod +x chatgpt-image-cli
+./chatgpt-image-cli --help
+```
+
+Release assets (per tag):
+
+| Platform | Asset |
+|---|---|
+| macOS Intel | `chatgpt-image-cli-darwin-amd64` |
+| macOS Apple Silicon | `chatgpt-image-cli-darwin-arm64` |
+| Linux x86_64 | `chatgpt-image-cli-linux-amd64` |
+| Windows x86_64 | `chatgpt-image-cli-windows-amd64.exe` |
+| Checksums | `checksums.txt` (SHA-256) |
+
+### From source
+
 ```bash
 git clone https://github.com/autoclaw-cc/chatgpt-image-cli.git
 cd chatgpt-image-cli
